@@ -1,7 +1,7 @@
 /**
  * Vibe Coder Dashboard — Local Execution Daemon
  *
- * Lightweight WebSocket server (~160 lines) that:
+ * Lightweight WebSocket server that:
  *   1. Authenticates browser connections via pre-shared DAEMON_TOKEN
  *   2. Receives workstream briefs from the dashboard
  *   3. Spawns Claude Code CLI or Codex CLI in allowlisted repo directories
@@ -12,6 +12,7 @@
  *   - Token auth on every WebSocket connection
  *   - Repo path validated against DAEMON_REPOS allowlist
  *   - Only spawns `claude` and `codex` binaries (never raw shell)
+ *   - Git operations use spawnSync with array args (no shell injection)
  *   - Runs as unprivileged user
  *
  * Run:  pnpm daemon        (tsx, dev mode)
@@ -19,7 +20,7 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { spawn, execSync, type ChildProcess } from 'child_process';
+import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -47,15 +48,15 @@ const children = new Map<string, ChildProcess>();
 const json = (ws: WebSocket, msg: unknown) =>
   ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(msg));
 
-const has = (bin: string) => {
-  try { execSync(`which ${bin}`, { stdio: 'ignore' }); return true; } catch { return false; }
-};
+/** Check if a binary exists. Uses spawnSync to avoid shell injection. */
+const has = (bin: string) =>
+  spawnSync('which', [bin], { stdio: 'ignore' }).status === 0;
 
 const repoInfo = (p: string) => {
   try {
-    const branch = execSync('git branch --show-current', { cwd: p, encoding: 'utf-8' }).trim();
-    const clean = execSync('git status --porcelain', { cwd: p, encoding: 'utf-8' }).trim() === '';
-    return { path: p, name: path.basename(p), branch, clean };
+    const branch = spawnSync('git', ['branch', '--show-current'], { cwd: p, encoding: 'utf-8' }).stdout.trim();
+    const dirty = spawnSync('git', ['status', '--porcelain'], { cwd: p, encoding: 'utf-8' }).stdout.trim();
+    return { path: p, name: path.basename(p), branch: branch || 'unknown', clean: dirty === '' };
   } catch {
     return { path: p, name: path.basename(p), branch: 'unknown', clean: false };
   }
@@ -100,7 +101,7 @@ wss.on('connection', (ws) => {
     switch (msg.type) {
       case 'execute-workstream': return execute(ws, msg);
       case 'kill':              return kill(ws, msg.workstream_id as string);
-      case 'push':              return push(ws, msg);
+      case 'push':              return gitPush(ws, msg);
       case 'list-repos':        return json(ws, { type: 'repo-list', repos: REPOS.map(repoInfo) });
     }
   });
@@ -122,7 +123,7 @@ function execute(ws: WebSocket, msg: Record<string, unknown>) {
     return json(ws, { type: 'error', workstream_id: id, message: `Path not found: ${repoPath}` });
   }
 
-  // Security: only claude and codex binaries
+  // Security: only claude and codex binaries (never arbitrary commands)
   let cmd: string;
   let args: string[];
   if (engine === 'claude-code') {
@@ -193,9 +194,9 @@ function kill(ws: WebSocket, id: string) {
   }
 }
 
-// ─── Git Push ───────────────────────────────────────────
+// ─── Git Push (all args via array — no shell injection possible) ───
 
-function push(ws: WebSocket, msg: Record<string, unknown>) {
+function gitPush(ws: WebSocket, msg: Record<string, unknown>) {
   const id = msg.workstream_id as string;
   const repoPath = path.resolve(msg.repo_path as string);
 
@@ -204,12 +205,27 @@ function push(ws: WebSocket, msg: Record<string, unknown>) {
   }
 
   try {
-    execSync('git add -A', { cwd: repoPath });
-    const commitMsg = (msg.commit_message as string) || `workstream ${id}`;
-    try { execSync(`git commit -m "${commitMsg}"`, { cwd: repoPath }); } catch { /* nothing to commit */ }
-    const branch = (msg.branch as string) || 'HEAD';
-    const out = execSync(`git push origin ${branch}`, { cwd: repoPath, encoding: 'utf-8' });
-    json(ws, { type: 'push-result', workstream_id: id, success: true, output: out || 'Pushed' });
+    // All git operations use spawnSync with array args — never shell strings
+    spawnSync('git', ['add', '-A'], { cwd: repoPath });
+
+    const commitMsg = String(msg.commit_message || `workstream ${id}`);
+    const commitResult = spawnSync('git', ['commit', '-m', commitMsg], {
+      cwd: repoPath,
+      encoding: 'utf-8',
+    });
+    // commit may fail if nothing to commit — that's OK
+
+    const branch = String(msg.branch || 'HEAD');
+    const pushResult = spawnSync('git', ['push', 'origin', branch], {
+      cwd: repoPath,
+      encoding: 'utf-8',
+    });
+
+    if (pushResult.status === 0) {
+      json(ws, { type: 'push-result', workstream_id: id, success: true, output: pushResult.stdout || pushResult.stderr || 'Pushed' });
+    } else {
+      json(ws, { type: 'push-result', workstream_id: id, success: false, output: pushResult.stderr || 'Push failed' });
+    }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     json(ws, { type: 'push-result', workstream_id: id, success: false, output: message });
