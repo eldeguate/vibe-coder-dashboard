@@ -1,0 +1,12 @@
+{
+  "name": "vibe-coder-dashboard",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @vibe-coder/dashboard dev",
+    "build": "pnpm --filter @vibe-coder/shared build && pnpm --filter @vibe-coder/dashboard build",
+    "typecheck": "pnpm -r run typecheck",
+    "daemon": "pnpm --filter @vibe-coder/daemon start",
+    "daemon:dev": "pnpm --filter @vibe-coder/daemon dev"
+  },
+  "packageManager": "pnpm@9.15.0"
+}
